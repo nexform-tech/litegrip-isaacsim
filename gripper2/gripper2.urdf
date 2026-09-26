@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 夹爪 URDF（基于 SolidWorks URDF Exporter 导出的 夹爪urdf2 (1).urdf，修正后）
+     修正：limit upper 0.043.5 → 0.067（CAD 精确行程）；mesh 路径 package:// → 相对路径。
+     运动学树：
+       base_link (固定件合并)
+         ├─ prismatic gripper_slide_joint_right → gripper_slider_link1 (axis +X)
+         └─ prismatic gripper_slide_joint_left  → gripper_slider_link2 (axis -X)
+     关节约定：q = 0 张开，q = +0.067 闭合（单指行程）。 -->
+<robot name="gripper2">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-7.90239142174285E-05 3.69945158980779E-05 -0.0166444528152071" rpy="0 0 0" />
+      <mass value="0.506299067530095" />
+      <inertia ixx="0.00014051955761899" ixy="-3.65495959038658E-06" ixz="-5.8232760915628E-07" iyy="0.000308492795970996" iyz="5.76221363581957E-07" izz="0.000345331384983772" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/base_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="gripper_slider_link1">
+    <inertial>
+      <origin xyz="0.0133451305147342 -0.00404000727940517 0.0126301584041473" rpy="0 0 0" />
+      <mass value="0.0354537367324049" />
+      <inertia ixx="1.73250515551137E-05" ixy="2.99209722680213E-08" ixz="-1.48556364855832E-06" iyy="1.26496403976931E-05" iyz="9.04302312412081E-08" izz="6.96029785351275E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/gripper_slider_link1.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/gripper_slider_link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="gripper_slide_joint_right" type="prismatic">
+    <origin xyz="-0.067 0.0010833 0.034083" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="gripper_slider_link1" />
+    <axis xyz="1 0 0" />
+    <limit lower="0" upper="0.067" effort="10" velocity="0.2" />
+  </joint>
+  <link name="gripper_slider_link2">
+    <inertial>
+      <origin xyz="-0.0133451305147341 0.0040400072794052 0.0126301584041473" rpy="0 0 0" />
+      <mass value="0.0354537367324048" />
+      <inertia ixx="1.73250515551138E-05" ixy="2.99209722680244E-08" ixz="1.4855636485583E-06" iyy="1.26496403976931E-05" iyz="-9.04302312413309E-08" izz="6.96029785351283E-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/gripper_slider_link2.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="meshes/gripper_slider_link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="gripper_slide_joint_left" type="prismatic">
+    <origin xyz="0.067 -0.0010833 0.034083" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="gripper_slider_link2" />
+    <axis xyz="-1 0 0" />
+    <limit lower="0" upper="0.067" effort="10" velocity="0.2" />
+  </joint>
+</robot>
