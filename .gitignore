@@ -225,3 +225,6 @@ recordings/
 *.mp4
 *.bag
 *.mcap
+
+# Written next to isaac_sim_gripper.py on every run
+gripper_sim_node_log.txt
