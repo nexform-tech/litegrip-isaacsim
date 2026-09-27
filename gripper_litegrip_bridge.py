@@ -12,7 +12,7 @@
     （只用 stdlib + Linux SocketCAN，无 zenoh / 无 server 依赖），
     所以只要 can0 是 up 的就能跑，不需要 litearm-python、不需要 7447。
 
-═══ 量纲与映射（★ 下面常量是占位，实测后再钉死 ★）═══
+═══ 量纲与映射 ═══
   仿真（gripper2.urdf）：2 个对称 prismatic 关节，q 单位米，
       q = 0 张开、q = +Q_FULL_M 闭合，单指行程 Q_FULL_M。
   真机（litegrip）：开口**毫米**，0 = 全合、travel_mm = 全开（标定口径 ≈ 120）。
@@ -22,17 +22,26 @@
       q_avg = 0        → mm = OPEN_MM   （全开）
       q_avg = Q_FULL_M → mm = CLOSED_MM （全合）
 
-  ★ 两个候选口径，实测二选一，**别混用**：
-      a) 标定口径  OPEN_MM ≈ 120.06  （= travel_range_rad 1.605 × rad_to_mm 74.8）
-      b) 物理口径  OPEN_MM ≈ 134     （= 2 × 67，两指合计；CAD 每指 0.067 m）
-    两者差约 10%。上机时「全开量一次间隙、全合量一次」把真实值填进来。
+  ★ OPEN_MM 已定为 110（2026-09-27 上机设定，口径 = litegrip 标定口径的 mm）。
+    改真机全开量就改 OPEN_MM 这一个常量。原先的两个推算候选（差约 10%，仅供参考）：
+      a) 标定推算 ≈ 120.06 （= travel_range_rad 1.605 × rad_to_mm 74.8）
+      b) 物理/CAD  ≈ 134   （= 2 × 0.067，两指合计）
+    110 不是上面任一推算值，不要拿它俩去反推。
 
   安全性：litegrip 内部会把目标 clamp 到标定行程 [pos_open_rad, pos_closed_rad]，
     所以口径填偏了只会「少开一点 / 提前停」，**不会超程顶坏机构**。
 
-⚠ 本桥只取轨迹「最后一个点」，**不按时间轴逐帧插值**。
-   真机侧用 --speed-mm-s 限速平滑逼近，所以不会跳变；要严格同速需逐帧采样
-  （可仿 isaac_sim_gripper.py 的 drive_pending）。
+⚠ 只取轨迹「最后一个点」，不按时间轴逐帧插值。真机侧由常驻帧流按 --speed-mm-s
+   限速平滑逼近（见 GripperLiteGrip 的 docstring），所以不会跳变；要严格同速需
+   逐帧采样（可仿 isaac_sim_gripper.py 的 drive_pending）。
+
+═══ 为什么是「常驻 MIT 帧流」而不是 move_at_speed ═══
+  DM4310 使能后 ~100 ms 收不到指令就自锁「通讯丢失」故障（err=13），电机随即不
+  响应后续指令。litegrip 的 move_at_speed/goto 是**阻塞定长斜坡**：流完 duration
+  就返回、之后不再发帧 → 桥在两次动作之间一空闲，电机就自锁；表现为「轨迹收到
+  了、真机却不动、读回 err=13」。所以本类不用 move_at_speed，改成 200 Hz 常驻
+  send_mit_frame：目标变化时限速逼近，无目标时 kp=0 零力矩守住（帧不停）。
+  帧流同时也是过力保护的载体（每周期都能读到新 tau）。
 
 用法（需 ROS2 Humble + can0 已 up；**不需要** litearm-python / litearm-server）：
   sudo ip link set can0 type can bitrate 1000000
@@ -44,6 +53,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -56,15 +66,19 @@ DEFAULT_LITEARM_LIB_DIR = "/opt/litearm"
 
 # ── ★ 占位常量：上机实测后改这三行 ★ ────────────────────────────────────────
 Q_FULL_M = 0.067     # 仿真单指满行程（米），与 gripper2.urdf 的 limit upper 一致（CAD）
-OPEN_MM = None       # 真机全开时开口毫米数 ← 实测填。None = 用下面标定口径占位
+OPEN_MM = 110.0      # 真机全开时开口毫米数（2026-09-27 设定；litegrip 标定口径）
 CLOSED_MM = 0.0      # 真机全合时开口毫米数（litegrip 0=全合，一般不用改）
 # ──────────────────────────────────────────────────────────────────────────
 
 # OPEN_MM 未实测时的占位口径（标定推算，见文件头 a/b 两说）
 OPEN_MM_CALIB = 120.06
 
-# 每帧耗时上限保护：一次移动最多走多久（秒），避免极端参数下长时间占住线程
-MAX_MOVE_S = 10.0
+# ── 常驻控制环参数（可用命令行覆盖）──────────────────────────────────────
+KP = 5.0            # 位置刚度（同 gripper_open_guard.py，小=柔）
+KD = 0.5            # 速度阻尼
+HZ = 200.0          # 帧流频率；★ 必须持续发：DM ~100ms 无帧即锁 err=13
+TAU_ABSMAX = 3.0    # 过力保护 Nm（0 = 关）：|tau| 超阈即冻住指令不再前推
+RECOVER_MIN_S = 0.5  # 故障恢复最小间隔秒数（否则 200Hz 会猛刷 enable()）
 
 
 def joints_to_mm(q):
@@ -83,31 +97,70 @@ def joints_to_mm(q):
     return max(CLOSED_MM, min(remap, mm))               # 再夹到 [合, 开]
 
 
-class GripperLiteGrip:
-    """litegrip 后台线程封装：目标变化时才发起一次阻塞式移动。
+def mm_to_rad(cfg, mm):
+    """真机开口毫米数 → 电机目标弧度（0mm=全合，张开方向 rad 减小）。"""
+    return cfg.pos_closed_rad - mm / cfg.rad_to_mm
 
-    litegrip 的 move_at_speed / goto_rad 是**阻塞**调用，内部按 duration 持续
-    下发 MIT 帧（DM 电机约 100 ms 收不到指令就失能，所以必须由它自己流式发完）。
-    因此这里用一个 worker 线程承载，ROS 回调只更新目标、不阻塞。
+
+def rad_to_mm(cfg, rad):
+    return (cfg.pos_closed_rad - rad) * cfg.rad_to_mm
+
+
+def advance_toward(q_cmd, q_target, max_step):
+    """限速逼近一步：返回 (新指令位置, 本周期 rad 位移)。
+
+    位移绝对值不超过 max_step（限速），且到位时**精确落在** q_target 不越过
+    （否则会在目标两侧来回抖）。到位后返回位移 0，可直接当速度前馈用。
+    """
+    step = q_target - q_cmd
+    if abs(step) <= max_step:
+        return q_target, 0.0
+    dq = max_step if step > 0 else -max_step
+    return q_cmd + dq, dq
+
+
+class GripperLiteGrip:
+    """litegrip 常驻 MIT 帧流封装（目标变化时限速逼近，空闲时零力矩守住）。
+
+    为什么不用 litegrip 的 move_at_speed/goto：它们是**阻塞定长斜坡**，流完
+    duration 就返回、之后不再发任何帧。DM4310 使能后 ~100 ms 收不到指令就自锁
+    「通讯丢失」故障（err=13），电机随即不响应后续指令 —— 于是桥两次动作之间一
+    空闲就废掉，表现为「轨迹收到了、真机不动、读回 err=13」。
+    （见 litegrip/gripper.py 的 _move_at_speed_rad：循环 steps 次后 return。）
+
+    本类改为常驻 worker 线程按 hz **不间断**下发 send_mit_frame：
+      - 有目标：按 speed_mm_s 限速把指令位置推向目标（每周期最多走
+        speed/rad_to_mm*dt），到位后原地守住；
+      - 无目标：kp=kd=0 零力矩守住（电机使能但可自由掰动），帧照发不停。
+    这样总线上永远有帧，不会自锁通讯丢失。帧流也是过力保护的载体：每周期
+    poll 一帧真反馈，|tau| 超阈就把指令压回当前实际位置（卸力）并清目标。
     """
 
-    def __init__(self, can="can0", can_id=0x08, speed_mm_s=30.0, dry_run=False):
+    def __init__(self, can="can0", can_id=0x08, speed_mm_s=30.0,
+                 kp=KP, kd=KD, hz=HZ, tau_absmax=TAU_ABSMAX, dry_run=False):
         self._speed = float(speed_mm_s)
+        self._kp = float(kp)
+        self._kd = float(kd)
+        self._hz = float(hz)
+        self._tau_absmax = float(tau_absmax)
         self._dry = bool(dry_run)
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._target = None      # 目标开口 mm；None → 不动
-        self._last_cmd = None    # 上次已下发的目标（去重）
+        self._target = None      # 目标开口 mm；None → 零力矩守住（不往前推）
+        self._last_cmd = None    # 上次已打印的目标（dry-run/日志去重）
+        self._queued = None      # 已下发给控制环的目标（仅日志用）
+        self._recover_at = -1e9  # 上次故障恢复尝试时刻（限频用）
         self._g = None
 
         if self._dry:
-            print(f"[夹爪][dry-run] 不连硬件，速度 {self._speed:.1f} mm/s", flush=True)
+            print(f"[夹爪][dry-run] 不连硬件，限速 {self._speed:.1f} mm/s",
+                  flush=True)
         else:
             from litegrip import LiteGrip  # noqa: E402  （延迟到用时再 import）
             self._g = LiteGrip(channel=can, can_id=can_id)
             self._g.connect()
             self._g.load_calibration()   # ★ 必须：config 默认值与注释自相矛盾
-            self._g.enable()
+            self._g.enable()             # 内部会先 clear_fault（若已锁故障）
             cfg = self._g.config
             print(f"[夹爪] litegrip 已使能 {can} id=0x{can_id:02X}"
                   f" 标定行程=({cfg.pos_open_rad:.3f}, {cfg.pos_closed_rad:.3f}) rad"
@@ -116,44 +169,106 @@ class GripperLiteGrip:
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
 
+    # ── 控制环 ──────────────────────────────────────────────────────────
     def _loop(self):
+        if self._dry:
+            self._dry_loop()
+            return
+
+        cfg = self._g.config
+        dt = 1.0 / self._hz
+        max_step = self._speed / cfg.rad_to_mm * dt   # 每周期最大 rad 增量
+        # 起步先拿一帧真反馈当指令起点（否则从缓存 0 起步会突然甩到目标）
+        q_cmd = self._g.get_position_rad()
+        print(f"[夹爪] 常驻帧流启动 {self._hz:.0f} Hz  kp={self._kp} kd={self._kd}"
+              f"  起点 {rad_to_mm(cfg, q_cmd):.1f} mm"
+              + (f"  过力阈值 {self._tau_absmax} Nm" if self._tau_absmax > 0
+                 else "  过力保护已关"), flush=True)
+        next_log = 0.0
+
         while not self._stop.is_set():
             with self._lock:
                 target = self._target
-            if target is None or target == self._last_cmd:
-                self._stop.wait(0.02)
-                continue
-            self._last_cmd = target
-            try:
-                self._move(target)
-            except Exception as e:  # noqa: BLE001
-                print(f"[夹爪] 移动失败({target:.1f} mm): {e}", flush=True)
-                self._last_cmd = None   # 允许下一帧重试
-                self._stop.wait(0.5)
 
-    def _move(self, mm):
-        if self._dry:
-            print(f"[夹爪][dry-run] 目标 {mm:.1f} mm", flush=True)
-            return
-        cur = self._g.get_position()                       # mm
-        dist = abs(mm - cur)
-        if dist < 0.05:
-            return
-        dur = min(dist / max(1e-6, self._speed), MAX_MOVE_S)
-        print(f"[夹爪] {cur:.1f} → {mm:.1f} mm（{self._speed:.1f} mm/s，约 {dur:.2f}s）",
-              flush=True)
-        self._g.move_at_speed(mm, speed_mm_s=self._speed)
+            if target is None:
+                # 零力矩守住：帧不能停，否则电机 ~100ms 自锁 err=13
+                self._g.send_mit_frame(q_cmd, 0.0, 0.0, dq=0.0, tau=0.0)
+                self._g.poll(timeout_s=0.0)
+                self._sleep(dt)
+                continue
+
+            # 限速逼近目标：每周期最多走 max_step，到位后在目标原地守住
+            q_target = mm_to_rad(cfg, target)
+            q_cmd, dq = advance_toward(q_cmd, q_target, max_step)
+
+            self._g.send_mit_frame(q_cmd, self._kp, self._kd,
+                                   dq=dq / dt, tau=0.0)
+            self._g.poll(timeout_s=0.0)
+            st = self._g.get_state(wait=False)
+            now = time.monotonic()
+
+            # ① 电机故障（如 err=13 通讯丢失）：限频清故障 + 重新使能，从实时位置续上
+            if st.error_code not in (0, 1):
+                if now - self._recover_at >= RECOVER_MIN_S:
+                    self._recover_at = now
+                    print(f"[夹爪] ⚠ 电机错误码 {st.error_code}，"
+                          f"尝试清故障 + 重新使能…", flush=True)
+                    try:
+                        self._g.enable()              # enable() 内部先 clear_fault
+                        q_cmd = self._g.get_position_rad()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[夹爪] 恢复失败: {type(e).__name__}: {e}",
+                              flush=True)
+                # 故障期帧照发（零力矩），别让总线静默再把通讯丢失续上
+                self._g.send_mit_frame(q_cmd, 0.0, 0.0, dq=0.0, tau=0.0)
+                self._sleep(dt)
+                continue
+
+            # ② 过力：把指令压回当前实际位置（误差归零→卸力）并清目标，不再前推
+            if self._tau_absmax > 0 and abs(st.torque_nm) >= self._tau_absmax:
+                print(f"[夹爪] ⚠ 过力 |tau|={abs(st.torque_nm):.2f} Nm ≥ "
+                      f"{self._tau_absmax:.2f}，冻在 "
+                      f"{rad_to_mm(cfg, st.position_rad):.1f} mm（不再前推）",
+                      flush=True)
+                q_cmd = st.position_rad
+                with self._lock:
+                    self._target = None
+                continue
+
+            if now >= next_log:
+                next_log = now + 0.5
+                moving = abs(dq) > 0.0 or abs(q_target - st.position_rad) > 0.05
+                if moving or target != self._queued:
+                    self._queued = target
+                    print(f"[夹爪] 指令={rad_to_mm(cfg, q_cmd):6.1f} mm  "
+                          f"实际={rad_to_mm(cfg, st.position_rad):6.1f} mm  "
+                          f"tau={st.torque_nm:+.3f} Nm", flush=True)
+
+            self._sleep(dt)
+
+    def _dry_loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                t = self._target
+            if t is not None and t != self._last_cmd:
+                self._last_cmd = t
+                print(f"[夹爪][dry-run] 目标 {t:.1f} mm", flush=True)
+            self._stop.wait(0.02)
+
+    def _sleep(self, dt):
+        self._stop.wait(dt)      # 用 Event.wait 睡：shutdown 时能立刻退出
 
     def set_target(self, mm):
-        """更新目标开口（非阻塞，由 worker 线程执行）。"""
+        """更新目标开口（非阻塞，由常驻帧流线程逼近）。"""
         with self._lock:
             self._target = float(mm)
 
     def shutdown(self):
         self._stop.set()
+        self._worker.join(timeout=1.0)
         if self._g is not None:
             try:
-                self._g.disable()      # 失能，避免长期hold力矩
+                self._g.disable()      # 失能，避免长期 hold 力矩
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -194,6 +309,13 @@ def main():
                    help=f"轨迹 topic（默认 {DEFAULT_TOPIC}）")
     p.add_argument("--speed-mm-s", type=float, default=30.0,
                    help="真机开口速度 mm/s（默认 30；越小越慢越安全）")
+    p.add_argument("--kp", type=float, default=KP,
+                   help="位置刚度（默认 5，与 gripper_open_guard.py 同口径）")
+    p.add_argument("--kd", type=float, default=KD, help="速度阻尼（默认 0.5）")
+    p.add_argument("--hz", type=float, default=HZ,
+                   help="常驻帧流频率（默认 200；★ 不能停，DM ~100ms 无帧锁 err=13）")
+    p.add_argument("--tau-absmax", type=float, default=TAU_ABSMAX,
+                   help="过力保护 Nm（默认 3.0；0 = 关）")
     p.add_argument("--lib-dir", default=DEFAULT_LITEARM_LIB_DIR,
                    help=f"litegrip 包所在目录（默认 {DEFAULT_LITEARM_LIB_DIR}）")
     p.add_argument("--dry-run", action="store_true",
@@ -214,7 +336,10 @@ def main():
 
     try:
         driver = GripperLiteGrip(can=args.can, can_id=args.can_id,
-                                 speed_mm_s=args.speed_mm_s, dry_run=args.dry_run)
+                                 speed_mm_s=args.speed_mm_s,
+                                 kp=args.kp, kd=args.kd, hz=args.hz,
+                                 tau_absmax=args.tau_absmax,
+                                 dry_run=args.dry_run)
     except Exception as e:  # noqa: BLE001
         print(f"[错误] 连接夹爪失败: {type(e).__name__}: {e}\n"
               f"      先确认: sudo ip link set {args.can} type can bitrate 1000000"
