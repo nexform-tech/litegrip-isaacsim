@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """夹爪 Isaac Sim 仿真节点：订阅 ROS2 /gripper/joint_traj 驱动夹爪关节。
 
-与机械臂仿真完全并行、独立：本节点只加载夹爪自己的 USD，自动识别里面的
-旋转(PhysicsRevoluteJoint)/直线(PhysicsPrismaticJoint)关节并驱动，
-不读也不改机械臂的任何文件。
+与机械臂仿真（isaac_sim_node.py）完全并行、独立：本节点只加载夹爪自己的
+USD，自动识别里面的旋转(PhysicsRevoluteJoint)/直线(PhysicsPrismaticJoint)
+关节并驱动，不碰机械臂的任何文件。
 
 运行方式（推荐用仓库里的 run_gripper.sh，会自动设置环境变量；手动运行如下）：
   cd $ISAAC_SIM_PATH            # 你的 Isaac Sim 安装目录
