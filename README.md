@@ -1,5 +1,7 @@
 # litegrip-isaacsim
 
+> English: this file · Chinese: [readme_zn.md](readme_zn.md)
+
 NVIDIA Isaac Sim simulation environment for the **LiteGrip lightweight robotic
 gripper series**, plus a ROS 2 bridge that mirrors the simulated opening onto the
 real gripper over raw SocketCAN.
