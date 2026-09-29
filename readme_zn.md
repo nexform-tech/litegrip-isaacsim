@@ -41,6 +41,17 @@ export ISAAC_SIM_PATH=/path/to/isaac-sim   # 默认：/home/qql/nvidia/isaac-sim
 ./run_gripper.sh
 ```
 
+## 在容器中开发
+
+VS Code 用户可完全跳过本机安装：仓库自带开发容器，内含 Isaac Sim 4.5、ROS 2
+Humble 桥接和 SocketCAN 工具。安装 Dev Containers 扩展，打开仓库，按 F1 选择
+"Dev Containers: Reopen in Container"。首次构建会下载 NVIDIA Isaac Sim 镜像，
+约 20 GB。
+
+容器内 `ISAAC_SIM_PATH` 已预设为 `/isaac-sim`，`./run_gripper.sh` 和上面的重建
+命令照常可用。GPU 配置、宿主机 ROS 组网和已知坑见
+[.devcontainer/README.md](.devcontainer/README.md)。
+
 ## 驱动夹爪
 
 `isaac_sim_gripper.py` 订阅 `/gripper/joint_traj`（`trajectory_msgs/JointTrajectory`），

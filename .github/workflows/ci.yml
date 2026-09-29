@@ -40,7 +40,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: Lint Markdown
-        run: npx --yes markdownlint-cli2@0.23.3 "README.md"
+        run: npx --yes markdownlint-cli2@0.23.3 "README.md" ".devcontainer/README.md"
 
       - name: Validate repository standards
         run: |
@@ -50,4 +50,5 @@ jobs:
           test -s LICENSE
           python3 -c "import json; json.load(open('.releaserc.json'))"
           python3 -c "import json; json.load(open('.markdownlint.json'))"
+          python3 -c "import json; json.load(open('.devcontainer/devcontainer.json'))"
           echo "repository standards OK"
