@@ -1,0 +1,7 @@
+# Keep container files with LF line endings on every platform. Docker builds
+# and bash inside the dev container fail on CRLF, and a Windows checkout with
+# core.autocrlf=true would otherwise produce it.
+*.sh text eol=lf
+Dockerfile text eol=lf
+.devcontainer/** text eol=lf
+/.gitattributes text eol=lf

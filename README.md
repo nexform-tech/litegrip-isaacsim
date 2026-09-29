@@ -44,6 +44,19 @@ export ISAAC_SIM_PATH=/path/to/isaac-sim   # default: /home/qql/nvidia/isaac-sim
 ./run_gripper.sh
 ```
 
+## Develop in a container
+
+VS Code users can skip the local install entirely: the repository ships a dev
+container with Isaac Sim 4.5, the bundled ROS 2 Humble bridge, and the
+SocketCAN tools. Install the Dev Containers extension, open the repository,
+and press F1, then choose "Dev Containers: Reopen in Container". The first
+build downloads the NVIDIA Isaac Sim image, about 20 GB.
+
+Inside the container `ISAAC_SIM_PATH` is already `/isaac-sim`, so
+`./run_gripper.sh` and the rebuild commands above work unchanged. GPU setup,
+host-ROS networking, and known pitfalls are in
+[.devcontainer/README.md](.devcontainer/README.md).
+
 ## Driving the gripper
 
 `isaac_sim_gripper.py` subscribes to `/gripper/joint_traj`

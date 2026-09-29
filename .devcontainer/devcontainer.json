@@ -1,0 +1,50 @@
+{
+  "name": "Isaac Sim 4.5 (ROS 2 Humble) - litegrip",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "ISAAC_SIM_VERSION": "4.5.0"
+    }
+  },
+  "overrideCommand": true,
+  "init": true,
+  "hostRequirements": {
+    "gpu": "optional"
+  },
+  "runArgs": [
+    "--gpus",
+    "all",
+    "--ipc=host"
+  ],
+  "containerEnv": {
+    "ACCEPT_EULA": "Y",
+    "PRIVACY_CONSENT": "Y",
+    "ISAAC_SIM_PATH": "/isaac-sim",
+    "NVIDIA_DRIVER_CAPABILITIES": "all"
+  },
+  "mounts": [
+    "source=isaac-sim-kit-cache,target=/isaac-sim/kit/cache,type=volume",
+    "source=isaac-sim-ov-cache,target=/root/.cache/ov,type=volume",
+    "source=isaac-sim-pip-cache,target=/root/.cache/pip,type=volume",
+    "source=isaac-sim-glcache,target=/root/.cache/nvidia/GLCache,type=volume",
+    "source=isaac-sim-computecache,target=/root/.nv/ComputeCache,type=volume",
+    "source=isaac-sim-logs,target=/root/.nvidia-omniverse/logs,type=volume",
+    "source=isaac-sim-data,target=/root/.local/share/ov/data,type=volume",
+    "source=isaac-sim-documents,target=/root/Documents,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/isaac-sim/kit/python/bin/python3",
+        "python.analysis.extraPaths": [
+          "/isaac-sim/exts",
+          "/isaac-sim/kit/python/lib/python3.10/site-packages"
+        ]
+      }
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}
