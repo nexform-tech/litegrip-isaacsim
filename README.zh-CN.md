@@ -138,7 +138,7 @@ Isaac Sim 自检（`gripper2/test_gripper2.py`）需要 GPU 和本机 Isaac Sim 
 
 ## 仓库规范
 
-本仓库遵循 NEXFORM ROBOTICS 共享的仓库规范：[AGENTS.md](AGENTS.md) 中的智能体操作规则、
+本仓库遵循 NEXFORM ROBOTICS 共享的仓库规范：[`.nexform-standards.json`](.nexform-standards.json) 中的智能体操作规则、
 Conventional Commits，以及每次合并到 `main` 时自动执行的 semantic-release 版本管理。
 
 ## 许可证
