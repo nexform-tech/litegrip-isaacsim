@@ -17,6 +17,7 @@ import contextlib
 import io
 import os
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -63,23 +64,36 @@ def _install_ros_stubs():
     })
 
 
+# 与 litegrip-python 最新 `factory_calibration.json` 一致（commit c187b78）。
+FACTORY_POS_CLOSED_RAD = 0.029564
+FACTORY_POS_OPEN_RAD = -1.141184
+FACTORY_RAD_TO_MM = 73.45731105242119
+FACTORY_TRAVEL_MM = abs(FACTORY_POS_CLOSED_RAD - FACTORY_POS_OPEN_RAD) * FACTORY_RAD_TO_MM
+assert abs(FACTORY_TRAVEL_MM - 86.0) < 1e-9, FACTORY_TRAVEL_MM
+
+
 class FakeLiteGrip:
     """`litegrip.LiteGrip` 的录制替身：不发真帧，只把帧记进 `.frames`。
 
     `position_rad` / `torque_nm` / `error_code` 是类属性，代表「电机当前反馈」，
-    测试可直接改它们来模拟真机状态。标定口径取自 litegrip 出厂文件。
+    测试可直接改它们来模拟真机状态。标定口径取自 litegrip 最新出厂文件。
     """
 
     instances = []              # 最近构造的实例在末尾
-    position_rad = 0.1140       # 标定 0 mm（全合）
+    position_rad = FACTORY_POS_CLOSED_RAD   # 标定 0 mm（全合）
     torque_nm = 0.0
     error_code = 0
 
     def __init__(self, channel=None, can_id=None):
         self.config = types.SimpleNamespace(
-            pos_closed_rad=0.1140, pos_open_rad=-1.4910, rad_to_mm=74.80)
+            pos_closed_rad=FACTORY_POS_CLOSED_RAD,
+            pos_open_rad=FACTORY_POS_OPEN_RAD,
+            rad_to_mm=FACTORY_RAD_TO_MM,
+            close_sign=1.0,
+            calibrated=True)
         self.frames = []        # (q, kp, kd, dq, tau)
         self.enable_calls = 0
+        self.calib_path = None
         self.disabled = False
         self.disconnected = False
         FakeLiteGrip.instances.append(self)
@@ -87,7 +101,8 @@ class FakeLiteGrip:
     def connect(self):
         return True
 
-    def load_calibration(self):
+    def load_calibration(self, path=None, template=None):
+        self.calib_path = path
         return True
 
     def enable(self):
@@ -135,76 +150,91 @@ import gripper_litegrip_bridge as bridge  # noqa: E402
 
 
 def _active_open_mm():
-    """当前生效的真机全开口径（与 joints_to_mm 的回落规则一致）。"""
-    return bridge.OPEN_MM if bridge.OPEN_MM is not None else bridge.OPEN_MM_CALIB
+    """SDK 出厂标定推出的全开量（未显式覆盖时）。"""
+    return FACTORY_TRAVEL_MM
 
 
 class JointsToMmTest(unittest.TestCase):
     """joints_to_mm：仿真关节位置(米) → 真机开口(mm)。"""
 
-    def setUp(self):
-        # 出厂状态：OPEN_MM 尚未实测校准，落到标定口径占位
-        self._saved_open_mm = bridge.OPEN_MM
-        bridge.OPEN_MM = None
-
-    def tearDown(self):
-        bridge.OPEN_MM = self._saved_open_mm
-
     def test_fully_open_maps_to_open_mm(self):
         self.assertAlmostEqual(
-            bridge.joints_to_mm([0.0, 0.0]), bridge.OPEN_MM_CALIB, places=3)
+            bridge.joints_to_mm([0.0, 0.0], _active_open_mm()),
+            _active_open_mm(), places=3)
 
     def test_fully_closed_maps_to_closed_mm(self):
         q = [bridge.Q_FULL_M, bridge.Q_FULL_M]
         self.assertAlmostEqual(
-            bridge.joints_to_mm(q), bridge.CLOSED_MM, places=6)
+            bridge.joints_to_mm(q, _active_open_mm()), bridge.CLOSED_MM, places=6)
 
     def test_half_travel_maps_to_half_opening(self):
         half = bridge.Q_FULL_M / 2.0
         self.assertAlmostEqual(
-            bridge.joints_to_mm([half, half]), bridge.OPEN_MM_CALIB / 2.0, places=3)
+            bridge.joints_to_mm([half, half], _active_open_mm()),
+            _active_open_mm() / 2.0, places=3)
 
     def test_fingers_are_averaged_not_extremised(self):
         # 只动一指时应落在中点，而不是取较小/较大那根
-        got = bridge.joints_to_mm([0.0, bridge.Q_FULL_M])
-        self.assertAlmostEqual(got, bridge.OPEN_MM_CALIB / 2.0, places=3)
+        got = bridge.joints_to_mm([0.0, bridge.Q_FULL_M], _active_open_mm())
+        self.assertAlmostEqual(got, _active_open_mm() / 2.0, places=3)
 
     def test_over_travel_is_clamped_at_both_ends(self):
         self.assertAlmostEqual(
-            bridge.joints_to_mm([0.1, 0.1]), bridge.CLOSED_MM, places=6)
+            bridge.joints_to_mm([0.1, 0.1], _active_open_mm()),
+            bridge.CLOSED_MM, places=6)
         self.assertAlmostEqual(
-            bridge.joints_to_mm([-0.02, -0.02]), bridge.OPEN_MM_CALIB, places=3)
+            bridge.joints_to_mm([-0.02, -0.02], _active_open_mm()),
+            _active_open_mm(), places=3)
 
     def test_empty_trajectory_returns_none(self):
-        self.assertIsNone(bridge.joints_to_mm([]))
-        self.assertIsNone(bridge.joints_to_mm(None))
+        self.assertIsNone(bridge.joints_to_mm([], _active_open_mm()))
+        self.assertIsNone(bridge.joints_to_mm(None, _active_open_mm()))
 
-    def test_measured_open_mm_overrides_calibration(self):
-        bridge.OPEN_MM = 134.0
-        self.assertAlmostEqual(bridge.joints_to_mm([0.0, 0.0]), 134.0, places=3)
+    def test_explicit_open_mm_overrides_calibration(self):
         self.assertAlmostEqual(
-            bridge.joints_to_mm([bridge.Q_FULL_M] * 2), bridge.CLOSED_MM, places=6)
+            bridge.joints_to_mm([0.0, 0.0], 80.0), 80.0, places=3)
+        self.assertAlmostEqual(
+            bridge.joints_to_mm([bridge.Q_FULL_M] * 2, 80.0),
+            bridge.CLOSED_MM, places=6)
 
     def test_result_stays_inside_calibrated_range(self):
+        open_mm = _active_open_mm()
         for q in (-0.5, -0.02, 0.0, 0.03, bridge.Q_FULL_M, 0.2):
-            got = bridge.joints_to_mm([q, q])
+            got = bridge.joints_to_mm([q, q], open_mm)
             self.assertGreaterEqual(got, bridge.CLOSED_MM)
-            self.assertLessEqual(got, bridge.OPEN_MM_CALIB)
+            self.assertLessEqual(got, open_mm)
 
 
-class MeasuredOpenMmTest(unittest.TestCase):
-    """OPEN_MM 已上机实测钉死（不再是 None 占位）。"""
+class CalibratedOpenMmTest(unittest.TestCase):
+    """全开量来自最新 SDK 标定文件，而不是手写占位常量。"""
 
-    def test_measured_open_mm_is_pinned(self):
-        self.assertEqual(bridge.OPEN_MM, 110.0)
+    def setUp(self):
+        self.cfg = FakeLiteGrip().config
 
-    def test_zero_positions_map_to_measured_open_mm(self):
+    def test_factory_travel_is_86_mm(self):
         self.assertAlmostEqual(
-            bridge.joints_to_mm([0.0, 0.0]), bridge.OPEN_MM, places=6)
+            bridge.calibrated_travel_mm(self.cfg), FACTORY_TRAVEL_MM, places=9)
 
-    def test_open_mm_wins_over_calibration_fallback(self):
+    def test_default_open_mm_is_the_calibrated_travel(self):
         self.assertAlmostEqual(
-            bridge.joints_to_mm([bridge.Q_FULL_M / 2] * 2), 55.0, places=3)
+            bridge.resolve_open_mm(None, self.cfg), FACTORY_TRAVEL_MM, places=9)
+
+    def test_explicit_open_mm_is_kept(self):
+        self.assertAlmostEqual(bridge.resolve_open_mm(50.0, self.cfg), 50.0)
+
+    def test_open_mm_beyond_travel_is_clamped(self):
+        self.assertAlmostEqual(
+            bridge.resolve_open_mm(110.0, self.cfg), FACTORY_TRAVEL_MM, places=9)
+
+    def test_load_calibration_config_uses_the_sdk_file(self):
+        cfg = bridge.load_calibration_config("can0")
+        self.assertAlmostEqual(
+            bridge.calibrated_travel_mm(cfg), FACTORY_TRAVEL_MM, places=9)
+
+    def test_lib_dir_without_litegrip_is_rejected(self):
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaises(RuntimeError):
+                bridge.ensure_litegrip_import(empty)
 
 
 class MmRadTest(unittest.TestCase):
@@ -212,26 +242,43 @@ class MmRadTest(unittest.TestCase):
 
     def setUp(self):
         self.cfg = types.SimpleNamespace(
-            pos_closed_rad=0.1140, pos_open_rad=-1.4910, rad_to_mm=74.80)
+            pos_closed_rad=FACTORY_POS_CLOSED_RAD,
+            pos_open_rad=FACTORY_POS_OPEN_RAD,
+            rad_to_mm=FACTORY_RAD_TO_MM,
+            close_sign=1.0)
 
     def test_closed_mm_is_pos_closed_rad(self):
         self.assertAlmostEqual(
             bridge.mm_to_rad(self.cfg, 0.0), self.cfg.pos_closed_rad, places=9)
 
     def test_round_trip(self):
-        for mm in (0.0, 12.5, 55.0, 110.0):
+        for mm in (0.0, 12.5, 55.0, FACTORY_TRAVEL_MM):
             self.assertAlmostEqual(
                 bridge.rad_to_mm(self.cfg, bridge.mm_to_rad(self.cfg, mm)),
                 mm, places=9)
 
     def test_opening_decreases_rad(self):
-        # 张开方向 rad 减小（与标定口径一致）
-        self.assertLess(bridge.mm_to_rad(self.cfg, 110.0),
+        # 张开方向 rad 减小（出厂安装，close_sign=+1）
+        self.assertLess(bridge.mm_to_rad(self.cfg, FACTORY_TRAVEL_MM),
                         bridge.mm_to_rad(self.cfg, 0.0))
 
-    def test_calibrated_travel_is_about_120mm(self):
-        travel = (self.cfg.pos_closed_rad - self.cfg.pos_open_rad) * self.cfg.rad_to_mm
-        self.assertAlmostEqual(travel, 120.05, places=1)
+    def test_targets_are_clamped_to_the_calibrated_travel(self):
+        self.assertAlmostEqual(
+            bridge.mm_to_rad(self.cfg, 1000.0), self.cfg.pos_open_rad, places=9)
+        self.assertAlmostEqual(
+            bridge.mm_to_rad(self.cfg, -100.0), self.cfg.pos_closed_rad, places=9)
+
+    def test_reverse_mount_round_trips(self):
+        cfg = types.SimpleNamespace(
+            pos_closed_rad=-1.0, pos_open_rad=0.5,
+            rad_to_mm=100.0, close_sign=-1.0)
+        self.assertAlmostEqual(bridge.mm_to_rad(cfg, 50.0), -0.5, places=9)
+        self.assertAlmostEqual(
+            bridge.rad_to_mm(cfg, bridge.mm_to_rad(cfg, 50.0)), 50.0, places=9)
+
+    def test_calibrated_travel_is_86_mm(self):
+        self.assertAlmostEqual(
+            bridge.calibrated_travel_mm(self.cfg), 86.0, places=9)
 
 
 class AdvanceTowardTest(unittest.TestCase):
@@ -307,7 +354,7 @@ class FrameStreamTest(unittest.TestCase):
 
     def setUp(self):
         FakeLiteGrip.instances.clear()
-        FakeLiteGrip.position_rad = 0.1140     # 全合（0 mm）
+        FakeLiteGrip.position_rad = FACTORY_POS_CLOSED_RAD   # 全合（0 mm）
         FakeLiteGrip.torque_nm = 0.0
         FakeLiteGrip.error_code = 0
 
@@ -400,6 +447,7 @@ class RouterTest(unittest.TestCase):
 
     def test_callback_uses_last_point(self):
         drv = mock.Mock()
+        drv.open_mm = _active_open_mm()
         node = bridge.GripperBridge.__new__(bridge.GripperBridge)
         node._drv = drv
         node.get_logger = mock.Mock(return_value=mock.Mock())

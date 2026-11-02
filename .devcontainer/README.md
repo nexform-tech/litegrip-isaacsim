@@ -25,7 +25,7 @@ NVIDIA's own run examples use.
 | ROS 2 | Humble bridge bundled with Isaac Sim, `exts/isaacsim.ros2.bridge/humble` |
 | Preset environment | `ISAAC_SIM_PATH=/isaac-sim`, so `./run_gripper.sh` needs no `export` |
 | Added OS tools | `can-utils` and `iproute2` for the SocketCAN bridge, `git`, `vim`, `less` |
-| Python | `/isaac-sim/kit/python/bin/python3` is the VS Code interpreter; plain `python3` is the OS Python 3.10 and runs the unit tests |
+| Python | `/isaac-sim/kit/python/bin/python3` is the VS Code interpreter; plain `python3` is the OS Python 3.10, runs the unit tests, and has the latest `litegrip-python` from PyPI installed for the bridge |
 | Caches | kit, Omniverse, pip, GLCache, and ComputeCache are named volumes, so they survive rebuilds |
 
 The container runs as root, matching NVIDIA's documented container workflow.

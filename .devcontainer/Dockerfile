@@ -20,5 +20,7 @@ RUN apt-get update \
       git \
       iproute2 \
       less \
+      python3-pip \
       vim-tiny \
+ && python3 -m pip install --no-cache-dir --upgrade litegrip-python \
  && rm -rf /var/lib/apt/lists/*
