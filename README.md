@@ -7,8 +7,8 @@ gripper series**, plus a ROS 2 bridge that mirrors the simulated opening onto th
 real gripper over raw SocketCAN.
 
 > **Status:** simulation model, simulation node and the litegrip bridge have
-> landed. The real-gripper opening calibration (`OPEN_MM`) is still a placeholder
-> — see [Real-hardware bridge](#real-hardware-bridge).
+> landed. The real-gripper opening is derived from the calibration file shipped
+> with the SDK — see [Real-hardware bridge](#real-hardware-bridge).
 
 ## Scope
 
@@ -109,24 +109,36 @@ python3 gripper_litegrip_bridge.py --dry-run    # print the mapped mm, touch not
 python3 gripper_litegrip_bridge.py --can can0   # actually move the gripper
 ```
 
+The bridge picks the newest SDK it can find:
+
+1. an installed `litegrip-python` (`pip install -U litegrip-python`);
+2. the sibling `../litegrip-python/src` checkout;
+3. a directory given with `--lib-dir` (it must contain `litegrip/`).
+
+Calibration comes from that SDK. `load_calibration()` with no argument reads the
+shipped `factory_calibration.json` — the measured geometry, currently
+`1.170748 rad × 73.4573 mm/rad = 86.0 mm` of travel. Pass `--calib PATH` to use a
+calibration measured on this unit (for example
+`~/.litegrip/can0_calibration.json`), or set `LITEGRIP_CALIB`.
+
 | | |
 | --- | --- |
 | Simulated | joint position, metres, `0` = open, `0.067` = closed |
-| Real | opening, millimetres, `0` = closed, `travel_mm` = open |
+| Real | opening, millimetres, `0` = closed, `OPEN_MM` = open |
+| Opening | `OPEN_MM` = calibrated travel (`86.0` mm for the current factory file) |
 | Mapping | `mm = CLOSED_MM + (OPEN_MM - CLOSED_MM) * (1 - q_avg / Q_FULL_M)` |
 
 Two things to know before pointing it at hardware:
 
-1. **`OPEN_MM` is an uncalibrated placeholder.** With `OPEN_MM = None` the bridge
-   falls back to `OPEN_MM_CALIB = 120.06` (derived from the factory calibration:
-   `travel_range_rad 1.605 × rad_to_mm 74.8`) and logs a warning. Measure the
-   real fully-open gap, then set `OPEN_MM` in the module header. A second
-   candidate for the same quantity is `134` (two fingers × 67 mm), about 10%
-   larger; pick one and do not mix them.
+1. **The opening comes from the calibration file, not a constant.** By default
+   the fully-open simulation pose maps to the calibrated travel. `--open-mm`
+   overrides that (for a measured gap), and the bridge clamps it to the
+   calibrated travel. The clamp is the bridge's own: `send_mit_frame` is a raw
+   frame and the SDK does not apply `clamp_to_travel` to it.
 2. **Only the last trajectory point is used.** The bridge does not interpolate
    along the trajectory; it rate-limits the real gripper with `--speed-mm-s`
-   (default `30` mm/s) instead. Overshoot cannot damage the mechanism — the
-   library clamps every target to the calibrated travel range.
+   (default `30` mm/s) instead. Overshoot cannot damage the mechanism — every
+   target is clamped to the calibrated travel range.
 
 The bridge writes nothing to disk and can be run read-only with `--dry-run`.
 

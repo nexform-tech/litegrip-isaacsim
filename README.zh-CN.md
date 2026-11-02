@@ -5,8 +5,8 @@
 **LiteGrip 轻量型机械夹爪系列**的 NVIDIA Isaac Sim 仿真环境，外加一个 ROS 2 桥接节点，
 通过原生 SocketCAN 把仿真开口量映射到真机夹爪。
 
-> **状态：** 仿真模型、仿真节点和 litegrip 桥接均已就位。真机夹爪开口标定（`OPEN_MM`）
-> 仍是占位值 —— 见[真机桥接](#真机桥接)。
+> **状态：** 仿真模型、仿真节点和 litegrip 桥接均已就位。真机开口量由 SDK 自带的
+> 标定文件推导 —— 见[真机桥接](#真机桥接)。
 
 ## 适用范围
 
@@ -100,20 +100,31 @@ python3 gripper_litegrip_bridge.py --dry-run    # 只打印映射后的毫米值
 python3 gripper_litegrip_bridge.py --can can0   # 真正驱动夹爪
 ```
 
+桥接按以下顺序找最新的 SDK：
+
+1. 已安装的 `litegrip-python`（`pip install -U litegrip-python`）；
+2. 仓库旁边的 `../litegrip-python/src` 源码；
+3. `--lib-dir` 指定的目录（该目录下必须有 `litegrip/`）。
+
+标定也来自这份 SDK。不带参数的 `load_calibration()` 读取 SDK 自带的
+`factory_calibration.json`（实测几何，当前为 `1.170748 rad × 73.4573 mm/rad = 86.0 mm`
+行程）。要使用本机实测的标定，传 `--calib PATH`（例如
+`~/.litegrip/can0_calibration.json`），或设置 `LITEGRIP_CALIB`。
+
 | | |
 | --- | --- |
 | 仿真侧 | 关节位置，米，`0` = 开，`0.067` = 闭 |
-| 真机侧 | 开口量，毫米，`0` = 闭，`travel_mm` = 开 |
+| 真机侧 | 开口量，毫米，`0` = 闭，`OPEN_MM` = 开 |
+| 全开量 | `OPEN_MM` = 标定文件推导的行程（当前出厂文件为 `86.0` mm） |
 | 映射 | `mm = CLOSED_MM + (OPEN_MM - CLOSED_MM) * (1 - q_avg / Q_FULL_M)` |
 
 接真机之前需要知道两件事：
 
-1. **`OPEN_MM` 是未标定的占位值。** 当 `OPEN_MM = None` 时，桥接会退回到
-   `OPEN_MM_CALIB = 120.06`（由出厂标定推出：`travel_range_rad 1.605 × rad_to_mm 74.8`）
-   并打印一条警告。请实测真机全开时的间隙，然后在模块头部设置 `OPEN_MM`。同一物理量的
-   另一个候选值是 `134`（两指 × 67 mm），约大 10%；二者选其一，不要混用。
+1. **开口量来自标定文件，不再是写死的常量。** 默认把仿真的全开姿态映射到标定行程；
+   `--open-mm` 可覆盖（例如本机实测的间隙），桥接会把它夹到标定行程内。这层夹紧由桥接
+   自己做：`send_mit_frame` 是底层帧，SDK 不会替它套 `clamp_to_travel`。
 2. **只取轨迹的最后一个点。** 桥接不沿轨迹插值，而是用 `--speed-mm-s`（默认 `30` mm/s）
-   对真机做限速。过冲不会损坏机构 —— 库会把每个目标夹紧到标定行程范围内。
+   对真机做限速。过冲不会损坏机构 —— 每个目标都被夹紧到标定行程范围内。
 
 桥接不写任何磁盘文件，可用 `--dry-run` 只读运行。
 

@@ -12,24 +12,31 @@
     （只用 stdlib + Linux SocketCAN，无 zenoh / 无 server 依赖），
     所以只要 can0 是 up 的就能跑，不需要 litearm-python、不需要 7447。
 
+SDK 解析顺序（--lib-dir 可显式覆盖）：
+  1. 已安装的 `litegrip`（pip install -U litegrip-python，最新发布版）；
+  2. 仓库布局里的 `../litegrip-python/src`（同目录下的最新源码）；
+  3. `--lib-dir` 指向的目录（该目录下必须有 `litegrip/`）。
+
+标定文件（--calib 可显式覆盖）：
+  默认读 SDK 自带的 `factory_calibration.json`（最新发布版里的实测几何）。
+  仿真全开映射到这份标定的真机全开量：
+      OPEN_MM = |pos_closed_rad - pos_open_rad| × rad_to_mm
+  当前出厂文件为 1.170748 rad × 73.4573 mm/rad ≈ 86.0 mm。
+  `--open-mm` 可覆盖（例如本机实测的开口）；超过标定行程会按行程夹紧。
+
 ═══ 量纲与映射 ═══
   仿真（gripper2.urdf）：2 个对称 prismatic 关节，q 单位米，
       q = 0 张开、q = +Q_FULL_M 闭合，单指行程 Q_FULL_M。
-  真机（litegrip）：开口**毫米**，0 = 全合、travel_mm = 全开（标定口径 ≈ 120）。
+  真机（litegrip）：开口**毫米**，0 = 全合、travel_mm = 全开（由标定文件算出）。
 
   映射（本文件的 joints_to_mm）：
       mm = CLOSED_MM + (OPEN_MM - CLOSED_MM) * (1 - q_avg / Q_FULL_M)
       q_avg = 0        → mm = OPEN_MM   （全开）
       q_avg = Q_FULL_M → mm = CLOSED_MM （全合）
 
-  ★ OPEN_MM 已定为 110（2026-09-27 上机设定，口径 = litegrip 标定口径的 mm）。
-    改真机全开量就改 OPEN_MM 这一个常量。原先的两个推算候选（差约 10%，仅供参考）：
-      a) 标定推算 ≈ 120.06 （= travel_range_rad 1.605 × rad_to_mm 74.8）
-      b) 物理/CAD  ≈ 134   （= 2 × 0.067，两指合计）
-    110 不是上面任一推算值，不要拿它俩去反推。
-
-  安全性：litegrip 内部会把目标 clamp 到标定行程 [pos_open_rad, pos_closed_rad]，
-    所以口径填偏了只会「少开一点 / 提前停」，**不会超程顶坏机构**。
+  安全性：send_mit_frame 是**底层帧**，不经 SDK 的 clamp_to_travel，
+    所以本桥在 mm_to_rad / set_target 里自己把目标夹进标定行程
+    [pos_open_rad, pos_closed_rad]；口径填大也只会提前停在行程端点。
 
 ⚠ 只取轨迹「最后一个点」，不按时间轴逐帧插值。真机侧由常驻帧流按 --speed-mm-s
    限速平滑逼近（见 GripperLiteGrip 的 docstring），所以不会跳变；要严格同速需
@@ -61,17 +68,16 @@ from trajectory_msgs.msg import JointTrajectory
 
 DEFAULT_TOPIC = "/gripper/joint_traj"
 
-# litegrip 包所在目录（/opt/litearm 下就是 litegrip/，装 litearm-server 时一起带的）
-DEFAULT_LITEARM_LIB_DIR = "/opt/litearm"
+# 仓库布局：litegrip-isaacsim 与 litegrip-python 并列，SDK 在 src/litegrip/。
+SIBLING_SDK_DIR = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.pardir, "litegrip-python", "src"))
 
-# ── ★ 占位常量：上机实测后改这三行 ★ ────────────────────────────────────────
+# ── ★ 量纲常量 ★ ───────────────────────────────────────────────────────────
 Q_FULL_M = 0.067     # 仿真单指满行程（米），与 gripper2.urdf 的 limit upper 一致（CAD）
-OPEN_MM = 110.0      # 真机全开时开口毫米数（2026-09-27 设定；litegrip 标定口径）
 CLOSED_MM = 0.0      # 真机全合时开口毫米数（litegrip 0=全合，一般不用改）
+OPEN_MM = None       # 真机全开 mm；None = 由 SDK 标定行程推导（推荐），--open-mm 可覆盖
 # ──────────────────────────────────────────────────────────────────────────
-
-# OPEN_MM 未实测时的占位口径（标定推算，见文件头 a/b 两说）
-OPEN_MM_CALIB = 120.06
 
 # ── 常驻控制环参数（可用命令行覆盖）──────────────────────────────────────
 KP = 5.0            # 位置刚度（同 gripper_open_guard.py，小=柔）
@@ -81,29 +87,99 @@ TAU_ABSMAX = 3.0    # 过力保护 Nm（0 = 关）：|tau| 超阈即冻住指令
 RECOVER_MIN_S = 0.5  # 故障恢复最小间隔秒数（否则 200Hz 会猛刷 enable()）
 
 
-def joints_to_mm(q):
+def ensure_litegrip_import(lib_dir=None):
+    """让 `from litegrip import LiteGrip` 可用，返回实际使用的包目录。
+
+    默认先用已安装的最新 SDK，再用仓库旁边的 `litegrip-python/src`。
+    `lib_dir` 明确指定时只认它（该目录下必须有 `litegrip/`）。
+    """
+    if lib_dir is not None:
+        candidate = os.path.abspath(lib_dir)
+        if not os.path.isdir(os.path.join(candidate, "litegrip")):
+            raise RuntimeError(
+                f"--lib-dir {lib_dir} 下没有 litegrip/（SDK 包目录）")
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+    else:
+        try:
+            import litegrip
+            return getattr(litegrip, "__file__", None) or "<litegrip>"
+        except ImportError:
+            if os.path.isdir(os.path.join(SIBLING_SDK_DIR, "litegrip")):
+                sys.path.insert(0, SIBLING_SDK_DIR)
+
+    try:
+        import litegrip
+    except ImportError as e:
+        raise RuntimeError(
+            "找不到 litegrip SDK：装最新版 `pip install -U litegrip-python`，"
+            "或用 --lib-dir 指向含 litegrip/ 的目录"
+            f"（默认还会尝试 {SIBLING_SDK_DIR}）。") from e
+    return getattr(litegrip, "__file__", None) or "<litegrip>"
+
+
+def calibrated_travel_mm(cfg):
+    """标定文件给出的全行程（毫米）。"""
+    return abs(cfg.pos_closed_rad - cfg.pos_open_rad) * cfg.rad_to_mm
+
+
+def resolve_open_mm(open_mm, cfg):
+    """确定真机全开量：显式值优先，否则用标定行程，并夹进行程。"""
+    travel = calibrated_travel_mm(cfg)
+    if open_mm is None:
+        return travel
+    value = float(open_mm)
+    if value > travel:
+        print(f"[夹爪] ⚠ 指定的全开量 {value:.1f} mm 超过标定行程 "
+              f"{travel:.1f} mm，按行程夹紧", flush=True)
+        value = travel
+    return max(CLOSED_MM, value)
+
+
+def load_calibration_config(can, calib_path=None):
+    """读 SDK 标定文件（默认出厂文件），不连 CAN、不动硬件。"""
+    from litegrip import LiteGrip
+
+    probe = LiteGrip(channel=can)          # 构造不会打开 CAN
+    loaded = probe.load_calibration(path=calib_path)
+    cfg = probe.config
+    if not loaded or not getattr(cfg, "calibrated", False):
+        raise RuntimeError(
+            f"没读到可用标定（channel={can}，"
+            f"path={calib_path or 'SDK 出厂文件'}）；"
+            "用 --calib 指定该通道的标定文件。")
+    return cfg
+
+
+def joints_to_mm(q, open_mm, closed_mm=CLOSED_MM, q_full_m=Q_FULL_M):
     """夹爪关节位置（米，可多指）→ 真机开口毫米数。
 
-    q=0 → 全开(OPEN_MM)；q=Q_FULL_M → 全合(CLOSED_MM)。两指对称，取平均即可
+    q=0 → 全开(open_mm)；q=q_full_m → 全合(closed_mm)。两指对称，取平均即可
     （gripper2.urdf 两个关节 limit 都是 [0, 0.067]，符号方向不影响幅值）。
     """
     if not q:
         return None
     q_avg = sum(float(x) for x in q) / len(q)
-    frac_open = 1.0 - q_avg / Q_FULL_M
+    frac_open = 1.0 - q_avg / q_full_m
     frac_open = max(0.0, min(1.0, frac_open))          # 夹住超程输入
-    remap = OPEN_MM if OPEN_MM is not None else OPEN_MM_CALIB
-    mm = CLOSED_MM + (remap - CLOSED_MM) * frac_open
-    return max(CLOSED_MM, min(remap, mm))               # 再夹到 [合, 开]
+    mm = closed_mm + (open_mm - closed_mm) * frac_open
+    return max(closed_mm, min(open_mm, mm))             # 再夹到 [合, 开]
 
 
 def mm_to_rad(cfg, mm):
-    """真机开口毫米数 → 电机目标弧度（0mm=全合，张开方向 rad 减小）。"""
-    return cfg.pos_closed_rad - mm / cfg.rad_to_mm
+    """真机开口毫米数 → 电机目标弧度，并夹进标定行程。
+
+    方向用 ``cfg.close_sign``：+1 = 闭合时 rad 增大（出厂安装），
+    -1 = 反装。send_mit_frame 不做这层夹紧，所以必须在这里做。
+    """
+    rad = cfg.pos_closed_rad - cfg.close_sign * mm / cfg.rad_to_mm
+    lo, hi = sorted((cfg.pos_closed_rad, cfg.pos_open_rad))
+    return max(lo, min(hi, rad))
 
 
 def rad_to_mm(cfg, rad):
-    return (cfg.pos_closed_rad - rad) * cfg.rad_to_mm
+    """电机弧度 → 真机开口毫米数（mm_to_rad 的反函数）。"""
+    return cfg.close_sign * (cfg.pos_closed_rad - rad) * cfg.rad_to_mm
 
 
 def advance_toward(q_cmd, q_target, max_step):
@@ -137,7 +213,9 @@ class GripperLiteGrip:
     """
 
     def __init__(self, can="can0", can_id=0x08, speed_mm_s=30.0,
-                 kp=KP, kd=KD, hz=HZ, tau_absmax=TAU_ABSMAX, dry_run=False):
+                 kp=KP, kd=KD, hz=HZ, tau_absmax=TAU_ABSMAX,
+                 lib_dir=None, calib_path=None, open_mm=OPEN_MM,
+                 dry_run=False):
         self._speed = float(speed_mm_s)
         self._kp = float(kp)
         self._kd = float(kd)
@@ -152,19 +230,33 @@ class GripperLiteGrip:
         self._recover_at = -1e9  # 上次故障恢复尝试时刻（限频用）
         self._g = None
 
+        sdk_dir = ensure_litegrip_import(lib_dir)
         if self._dry:
-            print(f"[夹爪][dry-run] 不连硬件，限速 {self._speed:.1f} mm/s",
+            cfg = load_calibration_config(can, calib_path)
+            self.open_mm = resolve_open_mm(open_mm, cfg)
+            print(f"[夹爪][dry-run] SDK={sdk_dir} 不连硬件，"
+                  f"标定行程={calibrated_travel_mm(cfg):.1f} mm，"
+                  f"全开={self.open_mm:.1f} mm，限速 {self._speed:.1f} mm/s",
                   flush=True)
         else:
             from litegrip import LiteGrip  # noqa: E402  （延迟到用时再 import）
             self._g = LiteGrip(channel=can, can_id=can_id)
             self._g.connect()
-            self._g.load_calibration()   # ★ 必须：config 默认值与注释自相矛盾
-            self._g.enable()             # 内部会先 clear_fault（若已锁故障）
+            loaded = self._g.load_calibration(path=calib_path)  # 最新出厂标定
             cfg = self._g.config
+            if not loaded or not getattr(cfg, "calibrated", False):
+                self._g.disconnect()
+                raise RuntimeError(
+                    f"没读到可用标定（channel={can}，"
+                    f"path={calib_path or 'SDK 出厂文件'}）；"
+                    "用 --calib 指定该通道的标定文件。")
+            self.open_mm = resolve_open_mm(open_mm, cfg)
+            self._g.enable()             # 内部会先 clear_fault（若已锁故障）
             print(f"[夹爪] litegrip 已使能 {can} id=0x{can_id:02X}"
+                  f" SDK={sdk_dir}"
                   f" 标定行程=({cfg.pos_open_rad:.3f}, {cfg.pos_closed_rad:.3f}) rad"
-                  f" rad_to_mm={cfg.rad_to_mm:.1f}", flush=True)
+                  f" rad_to_mm={cfg.rad_to_mm:.1f}"
+                  f" 全开={self.open_mm:.1f} mm", flush=True)
 
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
@@ -261,7 +353,7 @@ class GripperLiteGrip:
     def set_target(self, mm):
         """更新目标开口（非阻塞，由常驻帧流线程逼近）。"""
         with self._lock:
-            self._target = float(mm)
+            self._target = max(CLOSED_MM, min(self.open_mm, float(mm)))
 
     def shutdown(self):
         self._stop.set()
@@ -291,7 +383,7 @@ class GripperBridge(Node):
         if not msg.points:
             return
         q = [float(x) for x in msg.points[-1].positions]
-        mm = joints_to_mm(q)
+        mm = joints_to_mm(q, self._drv.open_mm)
         if mm is None:
             return
         self._drv.set_target(mm)
@@ -316,29 +408,29 @@ def main():
                    help="常驻帧流频率（默认 200；★ 不能停，DM ~100ms 无帧锁 err=13）")
     p.add_argument("--tau-absmax", type=float, default=TAU_ABSMAX,
                    help="过力保护 Nm（默认 3.0；0 = 关）")
-    p.add_argument("--lib-dir", default=DEFAULT_LITEARM_LIB_DIR,
-                   help=f"litegrip 包所在目录（默认 {DEFAULT_LITEARM_LIB_DIR}）")
+    p.add_argument("--lib-dir", default=None,
+                   help="含 litegrip/ 的目录；默认先用已安装的 litegrip，"
+                        "否则用仓库旁的 litegrip-python/src")
+    p.add_argument("--calib", default=None,
+                   help="标定文件路径；默认用 SDK 自带的 factory_calibration.json")
+    p.add_argument("--open-mm", type=float, default=OPEN_MM,
+                   help="真机全开开口毫米数；默认由标定行程推导")
     p.add_argument("--dry-run", action="store_true",
                    help="只打印换算出的 mm，不连 CAN、不动硬件")
     args = p.parse_args()
 
-    if not args.dry_run:
-        if not os.path.isdir(os.path.join(args.lib_dir, "litegrip")):
-            print(f"[错误] 在 {args.lib_dir} 下找不到 litegrip/。"
-                  f"用 --lib-dir 指定，或确认已装 litearm-server 运行时。",
-                  flush=True)
-            return 1
-        sys.path.insert(0, args.lib_dir)
-
-    if OPEN_MM is None:
-        print(f"[警告] OPEN_MM 尚未实测校准，暂用标定口径 {OPEN_MM_CALIB} mm 占位"
-              f"（实测全开间隙后改文件头的 OPEN_MM）。", flush=True)
+    if args.calib is not None and not os.path.isfile(args.calib):
+        print(f"[错误] 找不到标定文件: {args.calib}", flush=True)
+        return 1
 
     try:
         driver = GripperLiteGrip(can=args.can, can_id=args.can_id,
                                  speed_mm_s=args.speed_mm_s,
                                  kp=args.kp, kd=args.kd, hz=args.hz,
                                  tau_absmax=args.tau_absmax,
+                                 lib_dir=args.lib_dir,
+                                 calib_path=args.calib,
+                                 open_mm=args.open_mm,
                                  dry_run=args.dry_run)
     except Exception as e:  # noqa: BLE001
         print(f"[错误] 连接夹爪失败: {type(e).__name__}: {e}\n"
